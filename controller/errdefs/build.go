@@ -1,7 +1,8 @@
 package errdefs
 
 import (
-	"github.com/containerd/typeurl"
+	"github.com/containerd/typeurl/v2"
+	"github.com/moby/buildkit/solver/pb"
 	"github.com/moby/buildkit/util/grpcerrors"
 )
 
@@ -22,11 +23,11 @@ func (e *BuildError) ToProto() grpcerrors.TypedErrorProto {
 	return &e.Build
 }
 
-func WrapBuild(err error, ref string) error {
+func WrapBuild(err error, ref string, def *pb.Definition) error {
 	if err == nil {
 		return nil
 	}
-	return &BuildError{Build: Build{Ref: ref}, error: err}
+	return &BuildError{Build: Build{Ref: ref, Definition: def}, error: err}
 }
 
 func (b *Build) WrapError(err error) error {

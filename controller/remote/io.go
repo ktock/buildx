@@ -6,6 +6,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/docker/buildx/controller/control"
 	"github.com/docker/buildx/controller/pb"
 	"github.com/moby/sys/signal"
 	"github.com/pkg/errors"
@@ -26,7 +27,7 @@ type ioServerConfig struct {
 	signalFn func(context.Context, syscall.Signal) error
 
 	// resizeFn is a callback function called when a resize event is reached to the client.
-	resizeFn func(context.Context, winSize) error
+	resizeFn func(context.Context, control.WinSize) error
 }
 
 func serveIO(attachCtx context.Context, srv msgStream, initFn func(*pb.InitMessage) error, ioConfig *ioServerConfig) (err error) {
@@ -139,9 +140,9 @@ func serveIO(attachCtx context.Context, srv msgStream, initFn func(*pb.InitMessa
 				}
 			} else if resize := msg.GetResize(); resize != nil {
 				if ioConfig.resizeFn != nil {
-					ioConfig.resizeFn(ctx, winSize{
-						cols: resize.Cols,
-						rows: resize.Rows,
+					ioConfig.resizeFn(ctx, control.WinSize{
+						Cols: resize.Cols,
+						Rows: resize.Rows,
 					})
 				}
 			} else if sig := msg.GetSignal(); sig != nil {
@@ -165,12 +166,7 @@ type ioAttachConfig struct {
 	stdin          io.ReadCloser
 	stdout, stderr io.WriteCloser
 	signal         <-chan syscall.Signal
-	resize         <-chan winSize
-}
-
-type winSize struct {
-	rows uint32
-	cols uint32
+	resize         <-chan control.WinSize
 }
 
 func attachIO(ctx context.Context, stream msgStream, initMessage *pb.InitMessage, cfg ioAttachConfig) (retErr error) {
@@ -236,7 +232,7 @@ func attachIO(ctx context.Context, stream msgStream, initMessage *pb.InitMessage
 	if cfg.resize != nil {
 		eg.Go(func() error {
 			for {
-				var win winSize
+				var win control.WinSize
 				select {
 				case win = <-cfg.resize:
 				case <-done:
@@ -247,8 +243,8 @@ func attachIO(ctx context.Context, stream msgStream, initMessage *pb.InitMessage
 				if err := stream.Send(&pb.Message{
 					Input: &pb.Message_Resize{
 						Resize: &pb.ResizeMessage{
-							Rows: win.rows,
-							Cols: win.cols,
+							Rows: win.Rows,
+							Cols: win.Cols,
 						},
 					},
 				}); err != nil {

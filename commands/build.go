@@ -28,6 +28,7 @@ import (
 	dockeropts "github.com/docker/cli/opts"
 	"github.com/docker/docker/pkg/ioutils"
 	"github.com/docker/go-units"
+	solverpb "github.com/moby/buildkit/solver/pb"
 	"github.com/moby/buildkit/util/appcontext"
 	"github.com/moby/buildkit/util/grpcerrors"
 	"github.com/pkg/errors"
@@ -348,6 +349,7 @@ func launchControllerAndRunBuild(dockerCli command.Cli, options buildOptions) er
 
 	// Start build
 	var ref string
+	var def *solverpb.Definition
 	var retErr error
 	f := ioset.NewSingleForwarder()
 	f.SetReader(os.Stdin)
@@ -358,11 +360,18 @@ func launchControllerAndRunBuild(dockerCli command.Cli, options buildOptions) er
 			logrus.Debug("propagating stdin close")
 			return nil
 		})
-		ref, err = c.Build(ctx, options.BuildOptions, pr, os.Stdout, os.Stderr, options.progress)
+		if options.invoke == "debug-step" {
+			// Special mode where we don't get the result but get only the build definition.
+			// In this mode, Build() doesn't perform the build therefore always fails.
+			// The error returned by Build() contains *pb.Definition wrapped with *controllererror.BuildError.
+			options.BuildOptions.Debug = true
+		}
+		ref, def, err = c.Build(ctx, options.BuildOptions, pr, os.Stdout, os.Stderr, options.progress)
 		if err != nil {
 			var be *controllererrors.BuildError
 			if errors.As(err, &be) {
 				ref = be.Ref
+				def = be.Definition
 				retErr = err
 				// We can proceed to monitor
 			} else {
@@ -391,7 +400,7 @@ func launchControllerAndRunBuild(dockerCli command.Cli, options buildOptions) er
 			}
 			return errors.Errorf("failed to configure terminal: %v", err)
 		}
-		err = monitor.RunMonitor(ctx, ref, &options.BuildOptions, invokeConfig, c, options.progress, pr2, os.Stdout, os.Stderr)
+		err = monitor.RunMonitor(ctx, ref, def, &options.BuildOptions, invokeConfig, c, options.progress, pr2, os.Stdout, os.Stderr)
 		con.Reset()
 		if err := pw2.Close(); err != nil {
 			logrus.Debug("failed to close monitor stdin pipe reader")
@@ -408,12 +417,12 @@ func launchControllerAndRunBuild(dockerCli command.Cli, options buildOptions) er
 			return err
 		}
 	}
-	return nil
+	return retErr
 }
 
 func needsMonitor(invokeFlag string, retErr error) bool {
 	switch invokeFlag {
-	case "debug-shell":
+	case "debug-shell", "debug-step":
 		return true
 	case "on-error":
 		return retErr != nil
@@ -427,8 +436,7 @@ func parseInvokeConfig(invoke string) (cfg controllerapi.ContainerConfig, err er
 	switch invoke {
 	case "default", "debug-shell":
 		return cfg, nil
-	case "on-error":
-		// NOTE: we overwrite the command to run because the original one should fail on the failed step.
+	case "on-error", "debug-step":
 		// TODO: make this configurable.
 		cfg.Cmd = []string{"/bin/sh"}
 		return cfg, nil
@@ -578,7 +586,7 @@ func debugShellCmd(dockerCli command.Cli) *cobra.Command {
 			if err := con.SetRaw(); err != nil {
 				return errors.Errorf("failed to configure terminal: %v", err)
 			}
-			err = monitor.RunMonitor(ctx, "", nil, controllerapi.ContainerConfig{
+			err = monitor.RunMonitor(ctx, "", nil, nil, controllerapi.ContainerConfig{
 				Tty: true,
 			}, c, progress, os.Stdin, os.Stdout, os.Stderr)
 			con.Reset()

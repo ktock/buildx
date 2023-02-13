@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/containerd/containerd/pkg/seed"
+	"github.com/containerd/containerd/pkg/seed" //nolint:staticcheck // Global math/rand seed is deprecated, but still used by external dependencies
 	"github.com/docker/buildx/commands"
 	"github.com/docker/buildx/version"
 	"github.com/docker/cli/cli"
@@ -28,6 +28,7 @@ import (
 )
 
 func init() {
+	//nolint:staticcheck // Global math/rand seed is deprecated, but still used by external dependencies
 	seed.WithTimeAndRand()
 	stack.SetVersionInfo(version.Version, version.Revision)
 }

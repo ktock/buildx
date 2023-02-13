@@ -202,7 +202,7 @@ func RunBuild(ctx context.Context, dockerCli command.Cli, in controllerapi.Build
 		return nil, err
 	}
 
-	imageID, res, err := buildTargets(ctx, dockerCli, b.NodeGroup, nodes, map[string]build.Options{defaultTargetName: opts}, progressMode, in.Opts.MetadataFile, statusChan)
+	imageID, res, err := buildTargets(ctx, dockerCli, b.NodeGroup, nodes, map[string]build.Options{defaultTargetName: opts}, progressMode, in.Opts.MetadataFile, statusChan, in.Debug)
 	err = wrapBuildError(err, false)
 	if err != nil {
 		return nil, err
@@ -214,7 +214,7 @@ func RunBuild(ctx context.Context, dockerCli command.Cli, in controllerapi.Build
 	return res, nil
 }
 
-func buildTargets(ctx context.Context, dockerCli command.Cli, ng *store.NodeGroup, nodes []builder.Node, opts map[string]build.Options, progressMode string, metadataFile string, statusChan chan *client.SolveStatus) (imageID string, res *build.ResultContext, err error) {
+func buildTargets(ctx context.Context, dockerCli command.Cli, ng *store.NodeGroup, nodes []builder.Node, opts map[string]build.Options, progressMode string, metadataFile string, statusChan chan *client.SolveStatus, debug bool) (imageID string, res *build.ResultContext, err error) {
 	ctx2, cancel := context.WithCancel(context.TODO())
 	defer cancel()
 
@@ -228,12 +228,16 @@ func buildTargets(ctx context.Context, dockerCli command.Cli, ng *store.NodeGrou
 
 	var mu sync.Mutex
 	var idx int
-	resp, err := build.BuildWithResultHandler(ctx, nodes, opts, dockerutil.NewClient(dockerCli), confutil.ConfigDir(dockerCli), progress.Tee(printer, statusChan), func(driverIndex int, gotRes *build.ResultContext) {
+	resp, err := build.BuildWithResultHandler(ctx, nodes, opts, dockerutil.NewClient(dockerCli), confutil.ConfigDir(dockerCli), progress.Tee(printer, statusChan), func(driverIndex int, gotRes *build.ResultContext) error {
 		mu.Lock()
 		defer mu.Unlock()
 		if res == nil || driverIndex < idx {
 			idx, res = driverIndex, gotRes
 		}
+		if debug {
+			return errors.Errorf("debug mode")
+		}
+		return nil
 	})
 	err1 := printer.Wait()
 	if err == nil {
@@ -456,6 +460,7 @@ func controllerUlimitOpt2DockerUlimit(u *controllerapi.UlimitOpt) *dockeropts.Ul
 
 type ResultContextError struct {
 	ResultContext *build.ResultContext
+	Definition    *solverpb.Definition
 	error
 }
 
@@ -478,7 +483,7 @@ func wrapResultContext(wErr error, res *build.ResultContext) error {
 		return wErr
 	}
 	res.Done()
-	return &ResultContextError{ResultContext: res2, error: wErr}
+	return &ResultContextError{ResultContext: res2, Definition: def, error: wErr}
 }
 
 func DefinitionFromResultContext(ctx context.Context, res *build.ResultContext) (*solverpb.Definition, error) {

@@ -4,16 +4,20 @@ import (
 	"context"
 	"io"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/docker/buildx/build"
 	cbuild "github.com/docker/buildx/controller/build"
+	"github.com/docker/buildx/controller/control"
 	controllererrors "github.com/docker/buildx/controller/errdefs"
 	"github.com/docker/buildx/controller/pb"
 	"github.com/docker/buildx/util/ioset"
 	"github.com/docker/buildx/version"
 	controlapi "github.com/moby/buildkit/api/services/control"
 	"github.com/moby/buildkit/client"
+	gateway "github.com/moby/buildkit/frontend/gateway/client"
+	solverpb "github.com/moby/buildkit/solver/pb"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
@@ -21,21 +25,26 @@ import (
 
 type BuildFunc func(ctx context.Context, options *pb.BuildOptions, stdin io.Reader, statusChan chan *client.SolveStatus) (res *build.ResultContext, err error)
 
-func NewServer(buildFunc BuildFunc) *Server {
+type ContinueFunc func(ctx context.Context, resultCtx *build.ResultContext, target *solverpb.Definition, statusChan chan *client.SolveStatus) (res *build.ResultContext, err error)
+
+func NewServer(buildFunc BuildFunc, continueFunc ContinueFunc) *Server {
 	return &Server{
-		buildFunc: buildFunc,
+		buildFunc:    buildFunc,
+		continueFunc: continueFunc,
 	}
 }
 
 type Server struct {
-	buildFunc BuildFunc
-	session   map[string]session
-	sessionMu sync.Mutex
+	buildFunc    BuildFunc
+	continueFunc ContinueFunc
+	session      map[string]session
+	sessionMu    sync.Mutex
 }
 
 type session struct {
 	statusChan      chan *client.SolveStatus
 	result          *build.ResultContext
+	originalResult  *build.ResultContext
 	buildOptions    *pb.BuildOptions
 	inputPipe       *io.PipeWriter
 	curInvokeCancel func()
@@ -153,6 +162,7 @@ func (m *Server) Build(ctx context.Context, req *pb.BuildRequest) (*pb.BuildResp
 		s, ok := m.session[ref]
 		if ok {
 			s.statusChan = nil
+			m.session[ref] = s
 		}
 		m.sessionMu.Unlock()
 	}()
@@ -175,20 +185,30 @@ func (m *Server) Build(ctx context.Context, req *pb.BuildRequest) (*pb.BuildResp
 	defer cancel()
 	res, buildErr := m.buildFunc(ctx, req.Options, inR, statusChan)
 	m.sessionMu.Lock()
+	var def *solverpb.Definition
 	if s, ok := m.session[ref]; ok {
 		if buildErr != nil {
 			var re *cbuild.ResultContextError
 			if errors.As(buildErr, &re) && re.ResultContext != nil {
 				res = re.ResultContext
+				def = re.Definition
+			}
+		} else {
+			var err error
+			def, err = cbuild.DefinitionFromResultContext(ctx, res)
+			if err != nil {
+				m.sessionMu.Unlock()
+				return nil, errors.Errorf("failed to get definition from result: %v", err)
 			}
 		}
 		if res != nil {
 			s.result = res
+			s.originalResult = res
 			s.curBuildCancel = cancel
 			s.buildOptions = req.Options
 			m.session[ref] = s
-			if buildErr != nil {
-				buildErr = controllererrors.WrapBuild(buildErr, ref)
+			if buildErr != nil && def != nil {
+				buildErr = controllererrors.WrapBuild(buildErr, ref, def)
 			}
 		}
 	} else {
@@ -197,7 +217,9 @@ func (m *Server) Build(ctx context.Context, req *pb.BuildRequest) (*pb.BuildResp
 	}
 	m.sessionMu.Unlock()
 
-	return &pb.BuildResponse{}, buildErr
+	return &pb.BuildResponse{
+		Definition: def,
+	}, buildErr
 }
 
 func (m *Server) Status(req *pb.StatusRequest, stream pb.Controller_StatusServer) error {
@@ -343,6 +365,8 @@ func (m *Server) Invoke(srv pb.Controller_InvokeServer) error {
 	var resultCtx *build.ResultContext
 	initDoneCh := make(chan struct{})
 	initErrCh := make(chan error)
+	signalCh := make(chan syscall.Signal)
+	resizeCh := make(chan gateway.WinSize)
 	eg, egCtx := errgroup.WithContext(ctx)
 	eg.Go(func() error {
 		return serveIO(egCtx, srv, func(initMessage *pb.InitMessage) (retErr error) {
@@ -383,7 +407,14 @@ func (m *Server) Invoke(srv pb.Controller_InvokeServer) error {
 			stdin:  containerOut.Stdin,
 			stdout: containerOut.Stdout,
 			stderr: containerOut.Stderr,
-			// TODO: signal, resize
+			signalFn: func(_ context.Context, s syscall.Signal) error {
+				signalCh <- s
+				return nil
+			},
+			resizeFn: func(_ context.Context, w control.WinSize) error {
+				resizeCh <- gateway.WinSize{Rows: w.Rows, Cols: w.Cols}
+				return nil
+			},
 		})
 	})
 	eg.Go(func() error {
@@ -401,15 +432,19 @@ func (m *Server) Invoke(srv pb.Controller_InvokeServer) error {
 			return errors.New("no result is provided")
 		}
 		ccfg := build.ContainerConfig{
-			ResultCtx:  resultCtx,
-			Entrypoint: cfg.Entrypoint,
-			Cmd:        cfg.Cmd,
-			Env:        cfg.Env,
-			Tty:        cfg.Tty,
-			Stdin:      containerIn.Stdin,
-			Stdout:     containerIn.Stdout,
-			Stderr:     containerIn.Stderr,
-			Initial:    cfg.Initial,
+			ResultCtx:       resultCtx,
+			Entrypoint:      cfg.Entrypoint,
+			Cmd:             cfg.Cmd,
+			Env:             cfg.Env,
+			Tty:             cfg.Tty,
+			Stdin:           containerIn.Stdin,
+			Stdout:          containerIn.Stdout,
+			Stderr:          containerIn.Stderr,
+			Initial:         cfg.Initial,
+			SignalCh:        signalCh,
+			ResizeCh:        resizeCh,
+			Image:           cfg.Image,
+			ResultMountPath: cfg.ResultMountPath,
 		}
 		if !cfg.NoUser {
 			ccfg.User = &cfg.User
@@ -472,4 +507,60 @@ func toControlStatus(s *client.SolveStatus) *pb.StatusResponse {
 		})
 	}
 	return &resp
+}
+
+func (m *Server) Continue(ctx context.Context, req *pb.ContinueRequest) (*pb.ContinueResponse, error) {
+	ref := req.Ref
+	if ref == "" {
+		return nil, errors.New("continue: empty key")
+	}
+
+	m.sessionMu.Lock()
+	if _, ok := m.session[ref]; !ok || m.session[ref].result == nil {
+		m.sessionMu.Unlock()
+		return &pb.ContinueResponse{}, errors.Errorf("continue: unknown reference: %q", ref)
+	}
+	resultCtx := m.session[ref].originalResult
+	if m.session[ref].statusChan != nil {
+		m.sessionMu.Unlock()
+		return &pb.ContinueResponse{}, errors.New("continue: build or status ongoing or status didn't call")
+	}
+	statusChan := make(chan *client.SolveStatus)
+	s := m.session[ref]
+	s.statusChan = statusChan
+	m.session[ref] = s
+	m.sessionMu.Unlock()
+
+	defer func() {
+		close(statusChan)
+		m.sessionMu.Lock()
+		s, ok := m.session[ref]
+		if ok {
+			s.statusChan = nil
+			m.session[ref] = s
+		}
+		m.sessionMu.Unlock()
+	}()
+
+	// Get the target result context
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	res, err := m.continueFunc(ctx, resultCtx, req.Target, statusChan)
+	if err == nil {
+		m.sessionMu.Lock()
+		if s, ok := m.session[ref]; ok {
+			s.result = res
+			s.curBuildCancel = cancel
+			m.session[ref] = s
+			if res.Err != nil {
+				err = errors.Errorf("failed continue: %v", res.Err)
+			}
+		} else {
+			m.sessionMu.Unlock()
+			return nil, errors.Errorf("build: unknown key %v", ref)
+		}
+		m.sessionMu.Unlock()
+	}
+
+	return &pb.ContinueResponse{}, err
 }

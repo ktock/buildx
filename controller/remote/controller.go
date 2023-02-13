@@ -24,6 +24,7 @@ import (
 	"github.com/docker/buildx/version"
 	"github.com/docker/cli/cli/command"
 	"github.com/moby/buildkit/client"
+	solverpb "github.com/moby/buildkit/solver/pb"
 	"github.com/moby/buildkit/util/grpcerrors"
 	"github.com/pelletier/go-toml"
 	"github.com/pkg/errors"
@@ -124,6 +125,8 @@ func serveCmd(dockerCli command.Cli) *cobra.Command {
 			// prepare server
 			b := NewServer(func(ctx context.Context, options *controllerapi.BuildOptions, stdin io.Reader, statusChan chan *client.SolveStatus) (res *build.ResultContext, err error) {
 				return cbuild.RunBuild(ctx, dockerCli, *options, stdin, "quiet", statusChan)
+			}, func(ctx context.Context, resultCtx *build.ResultContext, target *solverpb.Definition, statusChan chan *client.SolveStatus) (res *build.ResultContext, err error) {
+				return build.GetResultAt(ctx, resultCtx, target, statusChan)
 			})
 			defer b.Close()
 

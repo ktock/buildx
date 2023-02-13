@@ -5,6 +5,7 @@ import (
 
 	imagetoolscmd "github.com/docker/buildx/commands/imagetools"
 	"github.com/docker/buildx/controller/remote"
+	"github.com/docker/buildx/monitor/dap"
 	"github.com/docker/buildx/util/logutil"
 	"github.com/docker/cli-docs-tool/annotation"
 	"github.com/docker/cli/cli"
@@ -91,6 +92,7 @@ func addCommands(cmd *cobra.Command, dockerCli command.Cli) {
 		remote.AddControllerCommands(cmd, dockerCli)
 		addDebugShellCommand(cmd, dockerCli)
 	}
+	dap.AddDAPCommands(cmd, dockerCli) // hidden command; we need it for emacs DAP support
 }
 
 func rootFlags(options *rootOptions, flags *pflag.FlagSet) {

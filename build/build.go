@@ -676,6 +676,12 @@ type ContainerConfig struct {
 	Cwd        *string
 
 	Initial bool
+
+	SignalCh <-chan syscall.Signal
+	ResizeCh <-chan gateway.WinSize
+
+	Image           string
+	ResultMountPath string
 }
 
 // ResultContext is a build result with the client that built it.
@@ -747,6 +753,29 @@ func Invoke(ctx context.Context, cfg ContainerConfig) error {
 			containerCfg, processCfg = *ccfg, *pcfg
 		}
 
+		if img := cfg.Image; img != "" {
+			def, err := llb.Image(img).Marshal(ctx)
+			if err != nil {
+				return nil, err
+			}
+			r, err := c.Solve(ctx, gateway.SolveRequest{
+				Definition: def.ToPB(),
+			})
+			if err != nil {
+				return nil, err
+			}
+			for i := range containerCfg.Mounts {
+				containerCfg.Mounts[i].Dest = filepath.Join(cfg.ResultMountPath, containerCfg.Mounts[i].Dest)
+			}
+			containerCfg.Mounts = append([]gateway.Mount{
+				{
+					Dest:      "/",
+					MountType: pb.MountType_BIND,
+					Ref:       r.Ref,
+				},
+			}, containerCfg.Mounts...)
+		}
+
 		ctr, err := c.NewContainer(ctx, containerCfg)
 		if err != nil {
 			return nil, err
@@ -757,8 +786,34 @@ func Invoke(ctx context.Context, cfg ContainerConfig) error {
 		if err != nil {
 			return nil, errors.Errorf("failed to start container: %v", err)
 		}
+		signalCh := cfg.SignalCh
+		if signalCh == nil {
+			signalCh = make(chan syscall.Signal)
+		}
+		resizeCh := cfg.ResizeCh
+		if resizeCh == nil {
+			resizeCh = make(chan gateway.WinSize)
+		}
 		errCh := make(chan error)
 		doneCh := make(chan struct{})
+		go func() {
+			for {
+				select {
+				case s := <-signalCh:
+					if err := proc.Signal(ctx, s); err != nil {
+						logrus.Warnf("failed to send signal %v %v", s, err)
+					}
+				case w := <-resizeCh:
+					if err := proc.Resize(ctx, w); err != nil {
+						logrus.Warnf("failed to resize %v: %v", w, err)
+					}
+				case <-ctx.Done():
+					return
+				case <-doneCh:
+					return
+				}
+			}
+		}()
 		go func() {
 			defer close(doneCh)
 			if err := proc.Wait(); err != nil {
@@ -1015,7 +1070,7 @@ func Build(ctx context.Context, nodes []builder.Node, opt map[string]Options, do
 	return BuildWithResultHandler(ctx, nodes, opt, docker, configDir, w, nil)
 }
 
-func BuildWithResultHandler(ctx context.Context, nodes []builder.Node, opt map[string]Options, docker *dockerutil.Client, configDir string, w progress.Writer, resultHandleFunc func(driverIndex int, rCtx *ResultContext)) (resp map[string]*client.SolveResponse, err error) {
+func BuildWithResultHandler(ctx context.Context, nodes []builder.Node, opt map[string]Options, docker *dockerutil.Client, configDir string, w progress.Writer, resultHandleFunc func(driverIndex int, rCtx *ResultContext) error) (resp map[string]*client.SolveResponse, err error) {
 	if len(nodes) == 0 {
 		return nil, errors.Errorf("driver required for build")
 	}
@@ -1278,7 +1333,9 @@ func BuildWithResultHandler(ctx context.Context, nodes []builder.Node, opt map[s
 							}
 							results.Set(resultKey(dp.driverIndex, k), res)
 							if resultHandleFunc != nil {
-								resultHandleFunc(dp.driverIndex, &ResultContext{Client: cc, Res: res})
+								if err := resultHandleFunc(dp.driverIndex, &ResultContext{Client: cc, Res: res}); err != nil {
+									return nil, err
+								}
 							}
 							return res, nil
 						}

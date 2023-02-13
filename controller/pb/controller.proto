@@ -3,6 +3,7 @@ syntax = "proto3";
 package buildx.controller.v1;
 
 import "github.com/moby/buildkit/api/services/control/control.proto";
+import "github.com/moby/buildkit/solver/pb/ops.proto";
 
 option go_package = "pb";
 
@@ -15,6 +16,7 @@ service Controller {
   rpc List(ListRequest) returns (ListResponse);
   rpc Disconnect(DisconnectRequest) returns (DisconnectResponse);
   rpc Info(InfoRequest) returns (InfoResponse);
+  rpc Continue(ContinueRequest) returns (ContinueResponse);
 }
 
 message BuildRequest {
@@ -50,6 +52,8 @@ message BuildOptions {
   UlimitOpt Ulimits = 24;
   // string Invoke: provided via Invoke API
   CommonOptions Opts = 25;
+
+  bool Debug = 26;
 }
 
 message InspectRequest {
@@ -82,7 +86,9 @@ message CommonOptions {
   string Provenance = 8; // TODO
 }
 
-message BuildResponse {}
+message BuildResponse {
+  pb.Definition Definition = 1;
+}
 
 message DisconnectRequest {
   string Ref = 1;
@@ -145,6 +151,8 @@ message ContainerConfig {
   bool NoCwd = 7; // Do not set cwd but use the image's default
   bool Tty = 8;
   bool Initial = 9; // Run container from the initial state of that stage (supported only on the failed step)
+  string Image = 10;
+  string ResultMountPath = 11;
 }
 
 message FdMessage {
@@ -187,3 +195,10 @@ message BuildxVersion {
   string version = 2;
   string revision = 3;
 }
+
+message ContinueRequest {
+  string Ref = 1;
+  pb.Definition Target = 2;
+}
+
+message ContinueResponse {}
