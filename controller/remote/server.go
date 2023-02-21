@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/docker/buildx/build"
+	cbuild "github.com/docker/buildx/controller/build"
+	controllererrors "github.com/docker/buildx/controller/errdefs"
 	"github.com/docker/buildx/controller/pb"
 	"github.com/docker/buildx/util/ioset"
 	"github.com/docker/buildx/version"
@@ -34,6 +36,7 @@ type Server struct {
 type session struct {
 	statusChan      chan *client.SolveStatus
 	result          *build.ResultContext
+	buildOptions    *pb.BuildOptions
 	inputPipe       *io.PipeWriter
 	curInvokeCancel func()
 	curBuildCancel  func()
@@ -81,6 +84,9 @@ func (m *Server) Disconnect(ctx context.Context, req *pb.DisconnectRequest) (res
 		if s.curInvokeCancel != nil {
 			s.curInvokeCancel()
 		}
+		if s.result != nil {
+			s.result.Done()
+		}
 	}
 	delete(m.session, key)
 	m.sessionMu.Unlock()
@@ -102,6 +108,23 @@ func (m *Server) Close() error {
 	}
 	m.sessionMu.Unlock()
 	return nil
+}
+
+func (m *Server) Inspect(ctx context.Context, req *pb.InspectRequest) (*pb.InspectResponse, error) {
+	ref := req.Ref
+	if ref == "" {
+		return nil, errors.New("inspect: empty key")
+	}
+	var bo *pb.BuildOptions
+	m.sessionMu.Lock()
+	if s, ok := m.session[ref]; ok {
+		bo = s.buildOptions
+	} else {
+		m.sessionMu.Unlock()
+		return nil, errors.Errorf("inspect: unknown key %v", ref)
+	}
+	m.sessionMu.Unlock()
+	return &pb.InspectResponse{Options: bo}, nil
 }
 
 func (m *Server) Build(ctx context.Context, req *pb.BuildRequest) (*pb.BuildResponse, error) {
@@ -150,19 +173,31 @@ func (m *Server) Build(ctx context.Context, req *pb.BuildRequest) (*pb.BuildResp
 	// Build the specified request
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	res, err := m.buildFunc(ctx, req.Options, inR, statusChan)
+	res, buildErr := m.buildFunc(ctx, req.Options, inR, statusChan)
 	m.sessionMu.Lock()
 	if s, ok := m.session[ref]; ok {
-		s.result = res
-		s.curBuildCancel = cancel
-		m.session[ref] = s
+		if buildErr != nil {
+			var re *cbuild.ResultContextError
+			if errors.As(buildErr, &re) && re.ResultContext != nil {
+				res = re.ResultContext
+			}
+		}
+		if res != nil {
+			s.result = res
+			s.curBuildCancel = cancel
+			s.buildOptions = req.Options
+			m.session[ref] = s
+			if buildErr != nil {
+				buildErr = controllererrors.WrapBuild(buildErr, ref)
+			}
+		}
 	} else {
 		m.sessionMu.Unlock()
 		return nil, errors.Errorf("build: unknown key %v", ref)
 	}
 	m.sessionMu.Unlock()
 
-	return &pb.BuildResponse{}, err
+	return &pb.BuildResponse{}, buildErr
 }
 
 func (m *Server) Status(req *pb.StatusRequest, stream pb.Controller_StatusServer) error {
@@ -374,6 +409,7 @@ func (m *Server) Invoke(srv pb.Controller_InvokeServer) error {
 			Stdin:      containerIn.Stdin,
 			Stdout:     containerIn.Stdout,
 			Stderr:     containerIn.Stderr,
+			Initial:    cfg.Initial,
 		}
 		if !cfg.NoUser {
 			ccfg.User = &cfg.User

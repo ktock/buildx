@@ -15,6 +15,7 @@ type BuildxController interface {
 	Close() error
 	List(ctx context.Context) (res []string, _ error)
 	Disconnect(ctx context.Context, ref string) error
+	Inspect(ctx context.Context, ref string) (*controllerapi.InspectResponse, error)
 }
 
 type ControlOptions struct {

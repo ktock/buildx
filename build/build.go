@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -673,12 +674,43 @@ type ContainerConfig struct {
 	Env        []string
 	User       *string
 	Cwd        *string
+
+	Initial bool
 }
 
 // ResultContext is a build result with the client that built it.
 type ResultContext struct {
 	Client *client.Client
 	Res    *gateway.Result
+	Err    *errdefs.SolveError
+
+	// GwClient allows to use the result/error on the specified gateway client.
+	GwClient gateway.Client
+
+	// GwCtx allows to use the result/error on the specified gateway client context.
+	GwCtx context.Context
+
+	gwDoneCh   chan struct{}
+	gwDoneOnce sync.Once
+}
+
+func (r *ResultContext) Done() {
+	if r.gwDoneCh == nil {
+		return
+	}
+	r.gwDoneOnce.Do(func() {
+		close(r.gwDoneCh)
+		r.gwDoneCh = nil
+	})
+}
+
+func (r *ResultContext) Build(buildFunc gateway.BuildFunc) (err error) {
+	if r.GwClient == nil || r.GwCtx == nil {
+		_, err = r.Client.Build(context.TODO(), client.SolveOpt{}, "buildx", buildFunc, nil)
+	} else {
+		_, err = buildFunc(r.GwCtx, r.GwClient)
+	}
+	return err
 }
 
 // Invoke invokes a build result as a container.
@@ -686,111 +718,53 @@ func Invoke(ctx context.Context, cfg ContainerConfig) error {
 	if cfg.ResultCtx == nil {
 		return errors.Errorf("result must be provided")
 	}
-	c, res := cfg.ResultCtx.Client, cfg.ResultCtx.Res
+	res := cfg.ResultCtx.Res
 
 	mainCtx := ctx
 
-	_, err := c.Build(context.TODO(), client.SolveOpt{}, "buildx", func(ctx context.Context, c gateway.Client) (*gateway.Result, error) {
+	invokeFn := func(ctx context.Context, c gateway.Client) (*gateway.Result, error) {
 		ctx, cancel := context.WithCancel(ctx)
 		go func() {
 			<-mainCtx.Done()
 			cancel()
 		}()
 
-		if res.Ref == nil {
-			return nil, errors.Errorf("no reference is registered")
+		var containerCfg gateway.NewContainerRequest
+		var processCfg gateway.StartRequest
+		if res != nil && cfg.ResultCtx.Err == nil {
+			logrus.Debugf("creating container from successful build")
+			ccfg, pcfg, err := configFromResult(ctx, c, res, cfg)
+			if err != nil {
+				return nil, err
+			}
+			containerCfg, processCfg = *ccfg, *pcfg
+		} else {
+			logrus.Debugf("creating container from failed build %+v", cfg)
+			ccfg, pcfg, err := configFromError(cfg.ResultCtx.Err, cfg)
+			if err != nil {
+				return nil, err
+			}
+			containerCfg, processCfg = *ccfg, *pcfg
 		}
-		st, err := res.Ref.ToState()
-		if err != nil {
-			return nil, err
-		}
-		def, err := st.Marshal(ctx)
-		if err != nil {
-			return nil, err
-		}
-		imgRef, err := c.Solve(ctx, gateway.SolveRequest{
-			Definition: def.ToPB(),
-		})
-		if err != nil {
-			return nil, err
-		}
-		ctr, err := c.NewContainer(ctx, gateway.NewContainerRequest{
-			Mounts: []gateway.Mount{
-				{
-					Dest:      "/",
-					MountType: pb.MountType_BIND,
-					Ref:       imgRef.Ref,
-				},
-			},
-		})
+
+		ctr, err := c.NewContainer(ctx, containerCfg)
 		if err != nil {
 			return nil, err
 		}
 		defer ctr.Release(context.TODO())
 
-		imgData := res.Metadata[exptypes.ExporterImageConfigKey]
-		var img *specs.Image
-		if len(imgData) > 0 {
-			img = &specs.Image{}
-			if err := json.Unmarshal(imgData, img); err != nil {
-				fmt.Println(err)
-				return nil, err
-			}
-		}
-
-		user := ""
-		if cfg.User != nil {
-			user = *cfg.User
-		} else if img != nil {
-			user = img.Config.User
-		}
-
-		cwd := ""
-		if cfg.Cwd != nil {
-			cwd = *cfg.Cwd
-		} else if img != nil {
-			cwd = img.Config.WorkingDir
-		}
-
-		env := []string{}
-		if img != nil {
-			env = append(env, img.Config.Env...)
-		}
-		env = append(env, cfg.Env...)
-
-		args := []string{}
-		if cfg.Entrypoint != nil {
-			args = append(args, cfg.Entrypoint...)
-		} else if img != nil {
-			args = append(args, img.Config.Entrypoint...)
-		}
-		if cfg.Cmd != nil {
-			args = append(args, cfg.Cmd...)
-		} else if img != nil {
-			args = append(args, img.Config.Cmd...)
-		}
-
-		proc, err := ctr.Start(ctx, gateway.StartRequest{
-			Args:   args,
-			Env:    env,
-			User:   user,
-			Cwd:    cwd,
-			Tty:    cfg.Tty,
-			Stdin:  cfg.Stdin,
-			Stdout: cfg.Stdout,
-			Stderr: cfg.Stderr,
-		})
+		proc, err := ctr.Start(ctx, processCfg)
 		if err != nil {
 			return nil, errors.Errorf("failed to start container: %v", err)
 		}
 		errCh := make(chan error)
 		doneCh := make(chan struct{})
 		go func() {
+			defer close(doneCh)
 			if err := proc.Wait(); err != nil {
 				errCh <- err
 				return
 			}
-			close(doneCh)
 		}()
 		select {
 		case <-doneCh:
@@ -800,8 +774,241 @@ func Invoke(ctx context.Context, cfg ContainerConfig) error {
 			return nil, err
 		}
 		return nil, nil
-	}, nil)
-	return err
+	}
+	return cfg.ResultCtx.Build(invokeFn)
+}
+
+func configFromResult(ctx context.Context, c gateway.Client, res *gateway.Result, cfg ContainerConfig) (*gateway.NewContainerRequest, *gateway.StartRequest, error) {
+	if res.Ref == nil {
+		return nil, nil, errors.Errorf("no reference is registered")
+	}
+	if cfg.Initial {
+		return nil, nil, errors.Errorf("starting from the container from the initial state of the step is supported only on the failed steps")
+	}
+	st, err := res.Ref.ToState()
+	if err != nil {
+		return nil, nil, err
+	}
+	def, err := st.Marshal(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	imgRef, err := c.Solve(ctx, gateway.SolveRequest{
+		Definition: def.ToPB(),
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	containerCfg := gateway.NewContainerRequest{
+		Mounts: []gateway.Mount{
+			{
+				Dest:      "/",
+				MountType: pb.MountType_BIND,
+				Ref:       imgRef.Ref,
+			},
+		},
+	}
+
+	imgData := res.Metadata[exptypes.ExporterImageConfigKey]
+	var img *specs.Image
+	if len(imgData) > 0 {
+		img = &specs.Image{}
+		if err := json.Unmarshal(imgData, img); err != nil {
+			return nil, nil, err
+		}
+	}
+
+	user := ""
+	if cfg.User != nil {
+		user = *cfg.User
+	} else if img != nil {
+		user = img.Config.User
+	}
+
+	cwd := ""
+	if cfg.Cwd != nil {
+		cwd = *cfg.Cwd
+	} else if img != nil {
+		cwd = img.Config.WorkingDir
+	}
+
+	env := []string{}
+	if img != nil {
+		env = append(env, img.Config.Env...)
+	}
+	env = append(env, cfg.Env...)
+
+	args := []string{}
+	if cfg.Entrypoint != nil {
+		args = append(args, cfg.Entrypoint...)
+	} else if img != nil {
+		args = append(args, img.Config.Entrypoint...)
+	}
+	if cfg.Cmd != nil {
+		args = append(args, cfg.Cmd...)
+	} else if img != nil {
+		args = append(args, img.Config.Cmd...)
+	}
+
+	processCfg := gateway.StartRequest{
+		Args:   args,
+		Env:    env,
+		User:   user,
+		Cwd:    cwd,
+		Tty:    cfg.Tty,
+		Stdin:  cfg.Stdin,
+		Stdout: cfg.Stdout,
+		Stderr: cfg.Stderr,
+	}
+
+	return &containerCfg, &processCfg, nil
+}
+
+func configFromError(solveErr *errdefs.SolveError, cfg ContainerConfig) (*gateway.NewContainerRequest, *gateway.StartRequest, error) {
+	if solveErr == nil {
+		return nil, nil, errors.Errorf("no result nor error is available")
+	}
+	var exec *pb.ExecOp
+	switch op := solveErr.Solve.Op.GetOp().(type) {
+	case *pb.Op_Exec:
+		exec = op.Exec
+	default:
+		return nil, nil, errors.Errorf("invoke: unsupported error type")
+	}
+
+	var mounts []gateway.Mount
+	for i, mnt := range exec.Mounts {
+		rid := solveErr.Solve.MountIDs[i]
+		if cfg.Initial {
+			rid = solveErr.Solve.InputIDs[i]
+		}
+		mounts = append(mounts, gateway.Mount{
+			Selector:  mnt.Selector,
+			Dest:      mnt.Dest,
+			ResultID:  rid,
+			Readonly:  mnt.Readonly,
+			MountType: mnt.MountType,
+			CacheOpt:  mnt.CacheOpt,
+			SecretOpt: mnt.SecretOpt,
+			SSHOpt:    mnt.SSHOpt,
+		})
+	}
+	containerCfg := gateway.NewContainerRequest{
+		Mounts:  mounts,
+		NetMode: exec.Network,
+	}
+
+	meta := exec.Meta
+	user := ""
+	if cfg.User != nil {
+		user = *cfg.User
+	} else {
+		user = meta.User
+	}
+
+	cwd := ""
+	if cfg.Cwd != nil {
+		cwd = *cfg.Cwd
+	} else {
+		cwd = meta.Cwd
+	}
+
+	env := append(meta.Env, cfg.Env...)
+
+	args := []string{}
+	if cfg.Entrypoint != nil {
+		args = append(args, cfg.Entrypoint...)
+	}
+	if cfg.Cmd != nil {
+		args = append(args, cfg.Cmd...)
+	}
+	if len(args) == 0 {
+		args = meta.Args
+	}
+
+	processCfg := gateway.StartRequest{
+		Args:   args,
+		Env:    env,
+		User:   user,
+		Cwd:    cwd,
+		Tty:    cfg.Tty,
+		Stdin:  cfg.Stdin,
+		Stdout: cfg.Stdout,
+		Stderr: cfg.Stderr,
+	}
+	return &containerCfg, &processCfg, nil
+}
+
+func GetResultAt(ctx context.Context, resultCtx *ResultContext, target *pb.Definition, statusChan chan *client.SolveStatus) (*ResultContext, error) {
+	c := resultCtx.Client
+	resultCtx2 := ResultContext{
+		Client: resultCtx.Client,
+	}
+
+	mainCtx := ctx
+
+	doneCh := make(chan struct{})
+	errCh := make(chan error)
+
+	done := int64(0)
+	cancelStatusFowarding := make(chan struct{})
+	defer func() {
+		close(cancelStatusFowarding)
+		atomic.StoreInt64(&done, 1)
+	}()
+	ch := make(chan *client.SolveStatus)
+	go func() {
+		for {
+			s := <-ch
+			if s == nil {
+				return
+			}
+			if atomic.LoadInt64(&done) == 0 {
+				select {
+				case statusChan <- s:
+				case <-cancelStatusFowarding:
+				}
+			}
+		}
+	}()
+
+	go func() {
+		_, err := c.Build(context.TODO(), client.SolveOpt{}, "buildx", func(ctx context.Context, c gateway.Client) (*gateway.Result, error) {
+			res2, err := c.Solve(ctx, gateway.SolveRequest{
+				Evaluate:   true,
+				Definition: target,
+			})
+			if err != nil {
+				var se *errdefs.SolveError
+				if errors.As(err, &se) {
+					resultCtx2.Err = se
+				} else {
+					return nil, err
+				}
+			}
+			// Record the client and ctx as well so that containers can be created from the SolveError.
+			resultCtx2.Res = res2
+			resultCtx2.GwClient = c
+			resultCtx2.GwCtx = ctx
+			gwDoneCh := make(chan struct{})
+			resultCtx2.gwDoneCh = gwDoneCh
+			close(doneCh)
+			<-gwDoneCh
+			return nil, nil
+		}, ch)
+		if err != nil {
+			errCh <- err
+		}
+	}()
+
+	select {
+	case <-doneCh:
+	case err := <-errCh:
+		return nil, err
+	case <-mainCtx.Done():
+		return nil, ctx.Err()
+	}
+	return &resultCtx2, nil
 }
 
 func Build(ctx context.Context, nodes []builder.Node, opt map[string]Options, docker *dockerutil.Client, configDir string, w progress.Writer) (resp map[string]*client.SolveResponse, err error) {
@@ -1071,7 +1278,7 @@ func BuildWithResultHandler(ctx context.Context, nodes []builder.Node, opt map[s
 							}
 							results.Set(resultKey(dp.driverIndex, k), res)
 							if resultHandleFunc != nil {
-								resultHandleFunc(dp.driverIndex, &ResultContext{cc, res})
+								resultHandleFunc(dp.driverIndex, &ResultContext{Client: cc, Res: res})
 							}
 							return res, nil
 						}

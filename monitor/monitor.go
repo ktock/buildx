@@ -11,8 +11,10 @@ import (
 
 	"github.com/containerd/console"
 	"github.com/docker/buildx/controller/control"
+	controllererrors "github.com/docker/buildx/controller/errdefs"
 	controllerapi "github.com/docker/buildx/controller/pb"
 	"github.com/docker/buildx/util/ioset"
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/term"
 )
@@ -30,7 +32,7 @@ Available commands are:
 `
 
 // RunMonitor provides an interactive session for running and managing containers via specified IO.
-func RunMonitor(ctx context.Context, curRef string, options controllerapi.BuildOptions, invokeConfig controllerapi.ContainerConfig, c control.BuildxController, progressMode string, stdin io.ReadCloser, stdout io.WriteCloser, stderr console.File) error {
+func RunMonitor(ctx context.Context, curRef string, options *controllerapi.BuildOptions, invokeConfig controllerapi.ContainerConfig, c control.BuildxController, progressMode string, stdin io.ReadCloser, stdout io.WriteCloser, stderr console.File) error {
 	defer func() {
 		if err := c.Disconnect(ctx, curRef); err != nil {
 			logrus.Warnf("disconnect error: %v", err)
@@ -74,14 +76,15 @@ func RunMonitor(ctx context.Context, curRef string, options controllerapi.BuildO
 			}
 			return "Switched IO\n"
 		}),
-		invokeFunc: func(ctx context.Context, ref string, in io.ReadCloser, out io.WriteCloser, err io.WriteCloser) error {
+		invokeFunc: func(ctx context.Context, ref string, init bool, in io.ReadCloser, out io.WriteCloser, err io.WriteCloser) error {
+			invokeConfig.Initial = init
 			return c.Invoke(ctx, ref, invokeConfig, in, out, err)
 		},
 	}
 
 	// Start container automatically
 	fmt.Fprintf(stdout, "Launching interactive container. Press Ctrl-a-c to switch to monitor console\n")
-	m.rollback(ctx, curRef)
+	m.rollback(ctx, curRef, false)
 
 	// Serve monitor commands
 	monitorForwarder := ioset.NewForwarder()
@@ -116,22 +119,52 @@ func RunMonitor(ctx context.Context, curRef string, options controllerapi.BuildO
 				case "":
 					// nop
 				case "reload":
+					var bo *controllerapi.BuildOptions
+					if curRef != "" {
+						// Rebuilding an existing session; Restore the build option used for building this session.
+						res, err := c.Inspect(ctx, curRef)
+						if err != nil {
+							fmt.Printf("failed to inspect the current build session: %v\n", err)
+						} else {
+							bo = res.Options
+						}
+					} else {
+						bo = options
+					}
+					if bo == nil {
+						fmt.Println("reload: no build option is provided")
+						continue
+					}
 					if curRef != "" {
 						if err := c.Disconnect(ctx, curRef); err != nil {
 							fmt.Println("disconnect error", err)
 						}
 					}
-					ref, err := c.Build(ctx, options, nil, stdout, stderr, progressMode) // TODO: support stdin, hold build ref
+					var resultUpdated bool
+					ref, err := c.Build(ctx, *bo, nil, stdout, stderr, progressMode) // TODO: support stdin, hold build ref
 					if err != nil {
-						fmt.Printf("failed to reload: %v\n", err)
+						var be *controllererrors.BuildError
+						if errors.As(err, &be) {
+							curRef = be.Ref
+							resultUpdated = true
+						} else {
+							fmt.Printf("failed to reload: %v\n", err)
+						}
 					} else {
 						curRef = ref
+						resultUpdated = true
+					}
+					if resultUpdated {
 						// rollback the running container with the new result
-						m.rollback(ctx, curRef)
+						m.rollback(ctx, curRef, false)
 						fmt.Fprint(stdout, "Interactive container was restarted. Press Ctrl-a-c to switch to the new container\n")
 					}
 				case "rollback":
-					m.rollback(ctx, curRef)
+					init := false
+					if len(args) >= 2 && args[1] == "init" {
+						init = true
+					}
+					m.rollback(ctx, curRef, init)
 					fmt.Fprint(stdout, "Interactive container was restarted. Press Ctrl-a-c to switch to the new container\n")
 				case "list":
 					refs, err := c.List(ctx)
@@ -163,7 +196,7 @@ func RunMonitor(ctx context.Context, curRef string, options controllerapi.BuildO
 						continue
 					}
 					ref := args[1]
-					m.rollback(ctx, ref)
+					m.rollback(ctx, ref, false)
 					curRef = ref
 				case "exit":
 					return
@@ -200,25 +233,28 @@ type readWriter struct {
 type monitor struct {
 	muxIO           *ioset.MuxIO
 	invokeIO        *ioset.Forwarder
-	invokeFunc      func(context.Context, string, io.ReadCloser, io.WriteCloser, io.WriteCloser) error
+	invokeFunc      func(context.Context, string, bool, io.ReadCloser, io.WriteCloser, io.WriteCloser) error
 	curInvokeCancel func()
 }
 
-func (m *monitor) rollback(ctx context.Context, ref string) {
+func (m *monitor) rollback(ctx context.Context, ref string, init bool) {
 	if m.curInvokeCancel != nil {
 		m.curInvokeCancel() // Finish the running container if exists
 	}
 	go func() {
 		// Start a new container
-		if err := m.invoke(ctx, ref); err != nil {
+		if err := m.invoke(ctx, ref, init); err != nil {
 			logrus.Debugf("invoke error: %v", err)
 		}
 	}()
 }
 
-func (m *monitor) invoke(ctx context.Context, ref string) error {
+func (m *monitor) invoke(ctx context.Context, ref string, init bool) error {
 	m.muxIO.Enable(1)
 	defer m.muxIO.Disable(1)
+	if ref == "" {
+		return nil
+	}
 	invokeCtx, invokeCancel := context.WithCancel(ctx)
 
 	containerIn, containerOut := ioset.Pipe()
@@ -236,7 +272,7 @@ func (m *monitor) invoke(ctx context.Context, ref string) error {
 	defer curInvokeCancel()
 	m.curInvokeCancel = curInvokeCancel
 
-	err := m.invokeFunc(invokeCtx, ref, containerIn.Stdin, containerIn.Stdout, containerIn.Stderr)
+	err := m.invokeFunc(invokeCtx, ref, init, containerIn.Stdin, containerIn.Stdout, containerIn.Stderr)
 	close(waitInvokeDoneCh)
 
 	return err

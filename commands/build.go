@@ -15,6 +15,7 @@ import (
 	"github.com/docker/buildx/controller"
 	cbuild "github.com/docker/buildx/controller/build"
 	"github.com/docker/buildx/controller/control"
+	controllererrors "github.com/docker/buildx/controller/errdefs"
 	controllerapi "github.com/docker/buildx/controller/pb"
 	"github.com/docker/buildx/monitor"
 	"github.com/docker/buildx/store"
@@ -345,29 +346,39 @@ func launchControllerAndRunBuild(dockerCli command.Cli, options buildOptions) er
 		}
 	}()
 
-	f := ioset.NewSingleForwarder()
-	pr, pw := io.Pipe()
-	f.SetWriter(pw, func() io.WriteCloser {
-		pw.Close() // propagate EOF
-		logrus.Debug("propagating stdin close")
-		return nil
-	})
-	f.SetReader(os.Stdin)
-
 	// Start build
-	ref, err := c.Build(ctx, options.BuildOptions, pr, os.Stdout, os.Stderr, options.progress)
-	if err != nil {
-		return errors.Wrapf(err, "failed to build") // TODO: allow invoke even on error
-	}
-	if err := pw.Close(); err != nil {
-		logrus.Debug("failed to close stdin pipe writer")
-	}
-	if err := pr.Close(); err != nil {
-		logrus.Debug("failed to close stdin pipe reader")
+	var ref string
+	var retErr error
+	f := ioset.NewSingleForwarder()
+	f.SetReader(os.Stdin)
+	if options.invoke != "debug-shell" {
+		pr, pw := io.Pipe()
+		f.SetWriter(pw, func() io.WriteCloser {
+			pw.Close() // propagate EOF
+			logrus.Debug("propagating stdin close")
+			return nil
+		})
+		ref, err = c.Build(ctx, options.BuildOptions, pr, os.Stdout, os.Stderr, options.progress)
+		if err != nil {
+			var be *controllererrors.BuildError
+			if errors.As(err, &be) {
+				ref = be.Ref
+				retErr = err
+				// We can proceed to monitor
+			} else {
+				return errors.Wrapf(err, "failed to build")
+			}
+		}
+		if err := pw.Close(); err != nil {
+			logrus.Debug("failed to close stdin pipe writer")
+		}
+		if err := pr.Close(); err != nil {
+			logrus.Debug("failed to close stdin pipe reader")
+		}
 	}
 
 	// post-build operations
-	if options.invoke != "" {
+	if needsMonitor(options.invoke, retErr) {
 		pr2, pw2 := io.Pipe()
 		f.SetWriter(pw2, func() io.WriteCloser {
 			pw2.Close() // propagate EOF
@@ -380,7 +391,7 @@ func launchControllerAndRunBuild(dockerCli command.Cli, options buildOptions) er
 			}
 			return errors.Errorf("failed to configure terminal: %v", err)
 		}
-		err = monitor.RunMonitor(ctx, ref, options.BuildOptions, invokeConfig, c, options.progress, pr2, os.Stdout, os.Stderr)
+		err = monitor.RunMonitor(ctx, ref, &options.BuildOptions, invokeConfig, c, options.progress, pr2, os.Stdout, os.Stderr)
 		con.Reset()
 		if err := pw2.Close(); err != nil {
 			logrus.Debug("failed to close monitor stdin pipe reader")
@@ -400,9 +411,26 @@ func launchControllerAndRunBuild(dockerCli command.Cli, options buildOptions) er
 	return nil
 }
 
+func needsMonitor(invokeFlag string, retErr error) bool {
+	switch invokeFlag {
+	case "debug-shell":
+		return true
+	case "on-error":
+		return retErr != nil
+	default:
+		return invokeFlag != ""
+	}
+}
+
 func parseInvokeConfig(invoke string) (cfg controllerapi.ContainerConfig, err error) {
 	cfg.Tty = true
-	if invoke == "default" {
+	switch invoke {
+	case "default", "debug-shell":
+		return cfg, nil
+	case "on-error":
+		// NOTE: we overwrite the command to run because the original one should fail on the failed step.
+		// TODO: make this configurable.
+		cfg.Cmd = []string{"/bin/sh"}
 		return cfg, nil
 	}
 
@@ -520,4 +548,50 @@ func (s *shmSize) Set(v string) error {
 
 func (s *shmSize) Type() string {
 	return s.org.Type()
+}
+
+func addDebugShellCommand(cmd *cobra.Command, dockerCli command.Cli) {
+	cmd.AddCommand(
+		debugShellCmd(dockerCli),
+	)
+}
+
+func debugShellCmd(dockerCli command.Cli) *cobra.Command {
+	var options control.ControlOptions
+	var progress string
+
+	cmd := &cobra.Command{
+		Use:   "debug-shell",
+		Short: "Start a monitor",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := context.TODO()
+			c, err := controller.NewController(ctx, options, dockerCli)
+			if err != nil {
+				return err
+			}
+			defer func() {
+				if err := c.Close(); err != nil {
+					logrus.Warnf("failed to close server connection %v", err)
+				}
+			}()
+			con := console.Current()
+			if err := con.SetRaw(); err != nil {
+				return errors.Errorf("failed to configure terminal: %v", err)
+			}
+			err = monitor.RunMonitor(ctx, "", nil, controllerapi.ContainerConfig{
+				Tty: true,
+			}, c, progress, os.Stdin, os.Stdout, os.Stderr)
+			con.Reset()
+			return err
+		},
+	}
+
+	flags := cmd.Flags()
+
+	flags.StringVar(&options.Root, "root", "", "Specify root directory of server to connect [experimental]")
+	flags.BoolVar(&options.Detach, "detach", runtime.GOOS == "linux", "Detach buildx server (supported only on linux) [experimental]")
+	flags.StringVar(&options.ServerConfig, "server-config", "", "Specify buildx server config file (used only when launching new server) [experimental]")
+	flags.StringVar(&progress, "progress", "auto", `Set type of progress output ("auto", "plain", "tty"). Use plain to show container output`)
+
+	return cmd
 }

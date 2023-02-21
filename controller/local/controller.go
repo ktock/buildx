@@ -8,6 +8,7 @@ import (
 	"github.com/docker/buildx/build"
 	cbuild "github.com/docker/buildx/controller/build"
 	"github.com/docker/buildx/controller/control"
+	controllererrors "github.com/docker/buildx/controller/errdefs"
 	controllerapi "github.com/docker/buildx/controller/pb"
 	"github.com/docker/cli/cli/command"
 	"github.com/pkg/errors"
@@ -21,9 +22,10 @@ func NewLocalBuildxController(ctx context.Context, dockerCli command.Cli) contro
 }
 
 type localController struct {
-	dockerCli command.Cli
-	ref       string
-	resultCtx *build.ResultContext
+	dockerCli    command.Cli
+	ref          string
+	resultCtx    *build.ResultContext
+	buildOptions *controllerapi.BuildOptions
 }
 
 func (b *localController) Invoke(ctx context.Context, ref string, cfg controllerapi.ContainerConfig, ioIn io.ReadCloser, ioOut io.WriteCloser, ioErr io.WriteCloser) error {
@@ -42,6 +44,7 @@ func (b *localController) Invoke(ctx context.Context, ref string, cfg controller
 		Stdin:      ioIn,
 		Stdout:     ioOut,
 		Stderr:     ioErr,
+		Initial:    cfg.Initial,
 	}
 	if !cfg.NoUser {
 		ccfg.User = &cfg.User
@@ -53,11 +56,23 @@ func (b *localController) Invoke(ctx context.Context, ref string, cfg controller
 }
 
 func (b *localController) Build(ctx context.Context, options controllerapi.BuildOptions, in io.ReadCloser, w io.Writer, out console.File, progressMode string) (string, error) {
-	res, err := cbuild.RunBuild(ctx, b.dockerCli, options, in, progressMode, nil)
-	if err != nil {
-		return "", err
+	res, buildErr := cbuild.RunBuild(ctx, b.dockerCli, options, in, progressMode, nil)
+	if buildErr != nil {
+		var re *cbuild.ResultContextError
+		if errors.As(buildErr, &re) && re.ResultContext != nil {
+			res = re.ResultContext
+		}
 	}
-	b.resultCtx = res
+	if res != nil {
+		b.resultCtx = res
+		b.buildOptions = &options
+		if buildErr != nil {
+			buildErr = controllererrors.WrapBuild(buildErr, b.ref)
+		}
+	}
+	if buildErr != nil {
+		return "", buildErr
+	}
 	return b.ref, nil
 }
 
@@ -76,4 +91,11 @@ func (b *localController) List(ctx context.Context) (res []string, _ error) {
 
 func (b *localController) Disconnect(ctx context.Context, key string) error {
 	return nil // nop
+}
+
+func (b *localController) Inspect(ctx context.Context, ref string) (*controllerapi.InspectResponse, error) {
+	if ref != b.ref {
+		return nil, errors.Errorf("unknown ref %q", ref)
+	}
+	return &controllerapi.InspectResponse{Options: b.buildOptions}, nil
 }
