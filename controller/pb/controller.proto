@@ -8,6 +8,7 @@ option go_package = "pb";
 
 service Controller {
   rpc Build(BuildRequest) returns (BuildResponse);
+  rpc Inspect(InspectRequest) returns (InspectResponse);
   rpc Status(StatusRequest) returns (stream StatusResponse);
   rpc Input(stream InputMessage) returns (InputResponse);
   rpc Invoke(stream Message) returns (stream Message);
@@ -49,6 +50,14 @@ message BuildOptions {
   UlimitOpt Ulimits = 24;
   // string Invoke: provided via Invoke API
   CommonOptions Opts = 25;
+}
+
+message InspectRequest {
+  string Ref = 1;
+}
+
+message InspectResponse {
+  BuildOptions Options = 1;
 }
 
 message UlimitOpt {
@@ -135,6 +144,7 @@ message ContainerConfig {
   string Cwd = 6;
   bool NoCwd = 7; // Do not set cwd but use the image's default
   bool Tty = 8;
+  bool Initial = 9; // Run container from the initial state of that stage (supported only on the failed step)
 }
 
 message FdMessage {

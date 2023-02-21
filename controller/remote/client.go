@@ -13,6 +13,7 @@ import (
 	"github.com/docker/buildx/util/progress"
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/identity"
+	"github.com/moby/buildkit/util/grpcerrors"
 	"github.com/pkg/errors"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
@@ -32,6 +33,8 @@ func NewClient(addr string) (*Client, error) {
 		grpc.WithContextDialer(dialer.ContextDialer),
 		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(defaults.DefaultMaxRecvMsgSize)),
 		grpc.WithDefaultCallOptions(grpc.MaxCallSendMsgSize(defaults.DefaultMaxSendMsgSize)),
+		grpc.WithUnaryInterceptor(grpcerrors.UnaryClientInterceptor),
+		grpc.WithStreamInterceptor(grpcerrors.StreamClientInterceptor),
 	}
 	conn, err := grpc.Dial(dialer.DialAddress(addr), gopts...)
 	if err != nil {
@@ -70,6 +73,9 @@ func (c *Client) List(ctx context.Context) (keys []string, retErr error) {
 }
 
 func (c *Client) Disconnect(ctx context.Context, key string) error {
+	if key == "" {
+		return nil
+	}
 	_, err := c.client().Disconnect(ctx, &pb.DisconnectRequest{Ref: key})
 	return err
 }
@@ -88,6 +94,10 @@ func (c *Client) Invoke(ctx context.Context, ref string, containerConfig pb.Cont
 		stderr: stderr,
 		// TODO: Signal, Resize
 	})
+}
+
+func (c *Client) Inspect(ctx context.Context, ref string) (*pb.InspectResponse, error) {
+	return c.client().Inspect(ctx, &pb.InspectRequest{Ref: ref})
 }
 
 func (c *Client) Build(ctx context.Context, options pb.BuildOptions, in io.ReadCloser, w io.Writer, out console.File, progressMode string) (string, error) {

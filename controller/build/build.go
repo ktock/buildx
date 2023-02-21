@@ -32,6 +32,7 @@ import (
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/session/auth/authprovider"
 	"github.com/moby/buildkit/solver/errdefs"
+	solverpb "github.com/moby/buildkit/solver/pb"
 	"github.com/moby/buildkit/util/grpcerrors"
 	"github.com/moby/buildkit/util/progress/progressui"
 	"github.com/morikuni/aec"
@@ -239,6 +240,9 @@ func buildTargets(ctx context.Context, dockerCli command.Cli, ng *store.NodeGrou
 		err = err1
 	}
 	if err != nil {
+		if res != nil {
+			err = wrapResultContext(err, res)
+		}
 		return "", nil, err
 	}
 
@@ -448,4 +452,50 @@ func controllerUlimitOpt2DockerUlimit(u *controllerapi.UlimitOpt) *dockeropts.Ul
 		}
 	}
 	return dockeropts.NewUlimitOpt(&values)
+}
+
+type ResultContextError struct {
+	ResultContext *build.ResultContext
+	error
+}
+
+func (e *ResultContextError) Unwrap() error {
+	return e.error
+}
+
+func wrapResultContext(wErr error, res *build.ResultContext) error {
+	if wErr == nil {
+		return nil
+	}
+	def, err := DefinitionFromResultContext(context.TODO(), res)
+	if err != nil {
+		logrus.Errorf("failed to get definition from result: %v", err)
+		return wErr
+	}
+	res2, err := build.GetResultAt(context.TODO(), res, def, nil)
+	if err != nil {
+		logrus.Errorf("failed to get result: %v", err)
+		return wErr
+	}
+	res.Done()
+	return &ResultContextError{ResultContext: res2, error: wErr}
+}
+
+func DefinitionFromResultContext(ctx context.Context, res *build.ResultContext) (*solverpb.Definition, error) {
+	if res.Res == nil {
+		return nil, errors.Errorf("result context doesn't contain build result")
+	}
+	ref, err := res.Res.SingleRef()
+	if err != nil {
+		return nil, err
+	}
+	st, err := ref.ToState()
+	if err != nil {
+		return nil, err
+	}
+	def, err := st.Marshal(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return def.ToPB(), nil
 }
