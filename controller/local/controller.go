@@ -4,7 +4,6 @@ import (
 	"context"
 	"io"
 
-	"github.com/containerd/console"
 	"github.com/docker/buildx/build"
 	cbuild "github.com/docker/buildx/controller/build"
 	"github.com/docker/buildx/controller/control"
@@ -31,8 +30,8 @@ type localController struct {
 	processes *processes.Manager
 }
 
-func (b *localController) Build(ctx context.Context, options controllerapi.BuildOptions, in io.ReadCloser, w io.Writer, out console.File, progressMode string) (string, *client.SolveResponse, error) {
-	resp, res, err := cbuild.RunBuild(ctx, b.dockerCli, options, in, progressMode, nil)
+func (b *localController) Build(ctx context.Context, options controllerapi.BuildOptions, in io.ReadCloser, statusChan chan *client.SolveStatus) (string, *client.SolveResponse, error) {
+	resp, res, err := cbuild.RunBuild(ctx, b.dockerCli, options, in, "quiet", statusChan)
 	if err != nil {
 		return "", nil, err
 	}

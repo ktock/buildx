@@ -11,6 +11,7 @@ import (
 	"text/tabwriter"
 
 	"github.com/containerd/console"
+	"github.com/docker/buildx/controller"
 	"github.com/docker/buildx/controller/control"
 	controllerapi "github.com/docker/buildx/controller/pb"
 	"github.com/docker/buildx/util/ioset"
@@ -125,7 +126,7 @@ func RunMonitor(ctx context.Context, curRef string, options controllerapi.BuildO
 							fmt.Println("disconnect error", err)
 						}
 					}
-					ref, _, err := c.Build(ctx, options, nil, stdout, stderr, progressMode) // TODO: support stdin, hold build ref
+					ref, _, err := controller.Build(ctx, c, options, nil, stdout, stderr, progressMode) // TODO: support stdin if needed
 					if err != nil {
 						fmt.Printf("failed to reload: %v\n", err)
 					} else {
